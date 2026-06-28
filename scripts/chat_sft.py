@@ -10,6 +10,7 @@ torchrun --standalone --nproc_per_node=8 -m scripts.chat_sft -- --device-batch-s
 """
 
 import gc
+import signal
 import argparse
 import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
@@ -31,6 +32,7 @@ from tasks.mmlu import MMLU
 from tasks.smoltalk import SmolTalk
 from tasks.customjson import CustomJSON
 from tasks.spellingbee import SimpleSpelling, SpellingBee
+from tasks.aya import Aya
 
 # -----------------------------------------------------------------------------
 # CLI arguments
@@ -66,6 +68,9 @@ parser.add_argument("--chatcore-max-sample", type=int, default=24, help="max pro
 # Data mixture
 parser.add_argument("--mmlu-epochs", type=int, default=3, help="number of epochs of MMLU in training mixture (teaches Multiple Choice)")
 parser.add_argument("--gsm8k-epochs", type=int, default=4, help="number of epochs of GSM8K in training mixture (teaches Math and Tool Use)")
+parser.add_argument("--aya-epochs", type=int, default=2, help="number of epochs of Aya multilingual SFT data (default: 2)")
+parser.add_argument("--no-aya", action="store_true", help="disable Aya multilingual data")
+parser.add_argument("--save-every", type=int, default=-1, help="save SFT checkpoint every N steps (-1 = only at end)")
 args = parser.parse_args()
 user_config = vars(args).copy()
 # -----------------------------------------------------------------------------
@@ -93,7 +98,17 @@ if not HAS_FA3:
     print0("WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback. Training will be less efficient.")
 
 # Load the model and tokenizer
-model, tokenizer, meta = load_model("base", device, phase="train", model_tag=args.model_tag, step=args.model_step)
+# Auto-resume: try SFT checkpoint first (for spot instance restart), fall back to base pretrain
+_sft_resume_step = 0
+_loading_from_sft = False
+try:
+    model, tokenizer, meta = load_model("sft", device, phase="train", model_tag=args.model_tag)
+    _sft_resume_step = meta.get("step", 0)
+    _loading_from_sft = True
+    print0(f"SFT checkpoint found — resuming from step {_sft_resume_step}")
+except Exception:
+    model, tokenizer, meta = load_model("base", device, phase="train", model_tag=args.model_tag, step=args.model_step)
+    print0("Starting fresh SFT from base pretrain checkpoint")
 
 # Inherit training hyperparameters from pretrained checkpoint (None = inherit, explicit value = override)
 pretrain_user_config = meta.get("user_config", {})
@@ -139,14 +154,22 @@ optimizer = model.setup_optimizer(unembedding_lr=args.unembedding_lr, embedding_
 # restore our fresh SFT LRs after loading.
 base_dir = get_base_dir()
 if args.load_optimizer:
-    optimizer_data = load_optimizer_state("base", device, rank=ddp_rank, model_tag=args.model_tag, step=args.model_step)
+    if _loading_from_sft:
+        optimizer_data = load_optimizer_state("sft", device, rank=ddp_rank, model_tag=args.model_tag)
+    else:
+        optimizer_data = load_optimizer_state("base", device, rank=ddp_rank, model_tag=args.model_tag, step=args.model_step)
     if optimizer_data is not None:
-        base_lrs = [group["lr"] for group in optimizer.param_groups]
-        optimizer.load_state_dict(optimizer_data)
-        del optimizer_data
-        for group, base_lr in zip(optimizer.param_groups, base_lrs):
-            group["lr"] = base_lr
-        print0("Loaded optimizer state from pretrained checkpoint (momentum buffers only, LRs reset)")
+        if _loading_from_sft:
+            optimizer.load_state_dict(optimizer_data)
+            del optimizer_data
+            print0(f"Loaded SFT optimizer state from step {_sft_resume_step} (LRs preserved)")
+        else:
+            base_lrs = [group["lr"] for group in optimizer.param_groups]
+            optimizer.load_state_dict(optimizer_data)
+            del optimizer_data
+            for group, base_lr in zip(optimizer.param_groups, base_lrs):
+                group["lr"] = base_lr
+            print0("Loaded optimizer state from pretrained checkpoint (momentum buffers only, LRs reset)")
     else:
         print0("WARNING: optimizer checkpoint not found, starting with fresh optimizer (slightly worse)")
 
@@ -156,20 +179,34 @@ if scaler is not None:
     print0("GradScaler enabled for fp16 training")
 
 # Override the initial learning rate as a fraction of the base learning rate
-for group in optimizer.param_groups:
-    group["lr"] = group["lr"] * args.init_lr_frac
-    group["initial_lr"] = group["lr"]
+# For SFT resume: preserve checkpoint LRs as initial_lr so the schedule continues correctly.
+# For fresh SFT: apply init_lr_frac to start below peak and warm up.
+if _loading_from_sft:
+    for group in optimizer.param_groups:
+        group["initial_lr"] = group["lr"]
+else:
+    for group in optimizer.param_groups:
+        group["lr"] = group["lr"] * args.init_lr_frac
+        group["initial_lr"] = group["lr"]
 
 # SFT data mixture and DataLoader
 identity_conversations_filepath = os.path.join(base_dir, "identity_conversations.jsonl")
+aya_tasks = []
+if not args.no_aya:
+    try:
+        aya_tasks = [Aya(split="train") for _ in range(args.aya_epochs)]
+        print0(f"Loaded Aya dataset: {len(aya_tasks[0]):,} multilingual examples × {args.aya_epochs} epochs")
+    except Exception as e:
+        print0(f"Warning: could not load Aya dataset ({e}), continuing without it")
 train_tasks = [
     SmolTalk(split="train"), # 460K rows of general conversations
     CustomJSON(filepath=identity_conversations_filepath), # 1000 rows of synthetic identity conversations
     CustomJSON(filepath=identity_conversations_filepath), # 2 epochs of these
     *[MMLU(subset="all", split="auxiliary_train") for _ in range(args.mmlu_epochs)], # 100K rows per epoch
     *[GSM8K(subset="main", split="train") for _ in range(args.gsm8k_epochs)], # 8K rows per epoch
-    SimpleSpelling(size=200000, split="train"), # 200K rows of Simple Spelling (e.g. spell the word 'apple')
-    SpellingBee(size=80000, split="train"), # 80K rows of Spelling Bee (e.g. how many 'r' are in 'strawberry'?)
+    SimpleSpelling(size=200000, split="train"), # 200K rows of Simple Spelling
+    SpellingBee(size=80000, split="train"), # 80K rows of Spelling Bee
+    *aya_tasks, # multilingual instruction following
 ]
 train_dataset = TaskMixture(train_tasks)
 print0(f"Training mixture: {len(train_dataset):,} rows (MMLU x{args.mmlu_epochs}, GSM8K x{args.gsm8k_epochs})")
@@ -327,13 +364,28 @@ def get_muon_momentum(it):
     return momentum
 
 # -----------------------------------------------------------------------------
+# SIGTERM / SIGINT handler for spot instance preemption
+_should_stop = False
+def _signal_handler(signum, frame):
+    global _should_stop
+    print0(f"\nReceived signal {signum} — will checkpoint and exit after current batch")
+    _should_stop = True
+signal.signal(signal.SIGTERM, _signal_handler)
+signal.signal(signal.SIGINT, _signal_handler)
+
+# SFT checkpoint directory
+output_dirname = args.model_tag if args.model_tag else f"d{depth}"
+checkpoint_dir = os.path.join(base_dir, "chatsft_checkpoints", output_dirname)
+
+# -----------------------------------------------------------------------------
 # Training loop
 x, y = next(train_loader) # prefetch the very first batch of data
 min_val_bpb = float("inf")
+val_bpb = None
 smooth_train_loss = 0 # EMA of training loss
 ema_beta = 0.9 # EMA decay factor
 total_training_time = 0 # total wall-clock time of training
-step = 0
+step = _sft_resume_step
 while True:
     flops_so_far = num_flops_per_token * args.total_batch_size * step
 
@@ -395,33 +447,33 @@ while True:
         })
         model.train()
 
-    # save checkpoint at the end of the run (all ranks participate so each saves its optimizer shard)
-    if last_step:
-        output_dirname = args.model_tag if args.model_tag else f"d{depth}" # e.g. d12
-        checkpoint_dir = os.path.join(base_dir, "chatsft_checkpoints", output_dirname)
-        save_checkpoint(
-            checkpoint_dir,
-            step,
-            orig_model.state_dict(),
-            optimizer.state_dict(),
-            {
-                "step": step,
-                "val_bpb": val_bpb, # loss at last step
-                "model_config": {
-                    "sequence_len": args.max_seq_len,
-                    "vocab_size": tokenizer.get_vocab_size(),
-                    "n_layer": depth,
-                    "n_head": model.config.n_head,
-                    "n_kv_head": model.config.n_kv_head,
-                    "n_embd": model.config.n_embd,
-                    "window_pattern": model.config.window_pattern,
-                },
-                "user_config": user_config, # inputs to the training script
+    def _sft_checkpoint_meta():
+        return {
+            "step": step, "val_bpb": val_bpb,
+            "model_config": {
+                "sequence_len": args.max_seq_len,
+                "vocab_size": tokenizer.get_vocab_size(),
+                "n_layer": depth, "n_head": model.config.n_head,
+                "n_kv_head": model.config.n_kv_head,
+                "n_embd": model.config.n_embd,
+                "window_pattern": model.config.window_pattern,
             },
-            rank=ddp_rank,
-        )
+            "user_config": user_config,
+        }
 
-    if last_step:
+    # Save checkpoint: at end, every save_every steps, or on preemption signal
+    should_save = (
+        last_step or
+        _should_stop or
+        (args.save_every > 0 and step > 0 and step % args.save_every == 0)
+    )
+    if should_save:
+        save_checkpoint(checkpoint_dir, step, orig_model.state_dict(),
+                        optimizer.state_dict(), _sft_checkpoint_meta(), rank=ddp_rank)
+
+    if last_step or _should_stop:
+        if _should_stop:
+            print0("Spot preemption signal — checkpoint saved, exiting")
         break
 
     # -------------------------------------------------------------------------

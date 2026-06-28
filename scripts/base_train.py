@@ -17,6 +17,7 @@ import gc
 import json
 import time
 import math
+import signal
 import argparse
 from dataclasses import asdict
 from contextlib import contextmanager
@@ -386,6 +387,18 @@ def get_weight_decay(it):
     return weight_decay_scaled * 0.5 * (1 + math.cos(math.pi * it / num_iterations))
 
 # -----------------------------------------------------------------------------
+# SIGTERM / SIGINT handler for spot instance preemption.
+# When a spot node is about to be reclaimed, SIGTERM arrives ~30 seconds before SIGKILL.
+# We set a flag and let the current batch finish, then save checkpoint and exit.
+_should_stop = False
+def _signal_handler(signum, frame):
+    global _should_stop
+    print0(f"\nReceived signal {signum} — will checkpoint and exit after current batch")
+    _should_stop = True
+signal.signal(signal.SIGTERM, _signal_handler)
+signal.signal(signal.SIGINT, _signal_handler)
+
+# -----------------------------------------------------------------------------
 # Training loop
 
 # Loop state (variables updated by the training loop)
@@ -498,8 +511,24 @@ while True:
             rank=ddp_rank,
         )
 
-    # termination conditions (TODO: possibly also add loss explosions etc.)
+    # termination conditions
     if last_step:
+        break
+    if _should_stop:
+        print0("Spot preemption signal received — saving emergency checkpoint and exiting")
+        save_checkpoint(
+            checkpoint_dir, step,
+            orig_model.state_dict(), optimizer.state_dict(),
+            {
+                "step": step, "val_bpb": val_bpb, "model_config": model_config_kwargs,
+                "user_config": user_config, "device_batch_size": args.device_batch_size,
+                "max_seq_len": args.max_seq_len, "total_batch_size": total_batch_size,
+                "dataloader_state_dict": dataloader_state_dict,
+                "loop_state": {"min_val_bpb": min_val_bpb, "smooth_train_loss": smooth_train_loss,
+                               "total_training_time": total_training_time},
+            },
+            rank=ddp_rank,
+        )
         break
 
     # -------------------------------------------------------------------------
