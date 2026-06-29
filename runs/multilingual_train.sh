@@ -1,14 +1,17 @@
 #!/bin/bash
 # =============================================================================
-# Full multilingual LLM training pipeline for a spot 1x H100 (50 hours).
+# Full multilingual LLM training pipeline for a non-interruptible 1x H100 (12.8 hours).
 #
-# Strategy: SMALL MODEL + HEAVY OVERTRAINING (inference-optimal, Llama-3.2 style)
+# Strategy: SMALL MODEL + MODERATE OVERTRAINING (quality-optimised for time budget)
 #   depth=20 → ~393M params
-#   ~52B tokens in 50h with FP8  →  ~132× Chinchilla  (vs ~107× for Llama-3.2-1B)
-#   Result: a small, fast-to-serve multilingual model that trains fully in budget
+#   Budget breakdown (12.8h total):
+#     ~1h   data download + tokenizer
+#     ~9.5h pretrain  →  9.5h × 300K tok/s × 3600 = ~10.3B tokens  →  ~26× Chinchilla
+#     ~2h   SFT
+#     ~0.2h export + HF upload
+#   Result: well-trained multilingual model that fits the exact compute budget
 #
 # Languages: EN + ZH ES FR DE JA RU PT AR KO IT NL PL TR VI HI ID CS UK SV (top-20)
-# Spot resilience: auto-resumes from latest checkpoint on restart
 #
 # Usage:
 #   HF_REPO=your-org/nanochat-multilingual HF_TOKEN=hf_xxx bash runs/multilingual_train.sh
@@ -28,18 +31,18 @@ HF_TOKEN="${HF_TOKEN:-}"
 MODEL_TAG="multilingual_d20"
 
 # ── Model & training knobs ────────────────────────────────────────────────────
-# depth=20   → model_dim=1280, ~393M params (fast inference, fits any GPU)
+# depth=20   → ~393M params (fast inference, fits any GPU)
 # BATCH=64   → 64 × 2048 = 131K tokens/rank; 8 grad-accum for 1M total batch
-# TOTAL_BS   → 1,048,576 tokens  (1M, divisible by 64×2048=131072, 8 accum steps)
-# RATIO=150  → 150 × 393M ≈ 59B token budget; spot preemption will stop earlier;
-#              resume + retrain on the next spot session to consume remaining tokens
+# TOTAL_BS   → 1,048,576 tokens (1M, divisible by 64×2048=131072, 8 accum steps)
+# RATIO=26   → 26 × 393M ≈ 10.2B tokens → ~9.5h pretrain on H100 with FP8
+# Data       → 120 EN shards + 5 per non-EN lang (dataloader cycles as needed)
 # ─────────────────────────────────────────────────────────────────────────────
 TEST_RUN="${TEST_RUN:-}"
 if [ -n "$TEST_RUN" ]; then
     DEPTH=4; SEQ_LEN=256; BATCH=1; TOTAL_BS=512; RATIO=5; DEVICE_ARGS="--device-type=cpu"
-    echo "TEST MODE: tiny model"
+    echo "TEST MODE: tiny model on CPU"
 else
-    DEPTH=20; SEQ_LEN=2048; BATCH=64; TOTAL_BS=1048576; RATIO=150; DEVICE_ARGS=""
+    DEPTH=20; SEQ_LEN=2048; BATCH=64; TOTAL_BS=1048576; RATIO=26; DEVICE_ARGS=""
 fi
 
 # =============================================================================
@@ -68,7 +71,7 @@ if [ -f "$SFT_DONE_FLAG" ]; then
     echo "SFT already complete. Proceeding to HF upload."
     PHASE="upload"
 elif [ -f "$PRETRAIN_DONE_FLAG" ]; then
-    echo "Pretraining complete. Starting/resuming SFT."
+    echo "Pretraining complete. Starting SFT."
     PHASE="sft"
 else
     PRETRAIN_STEP=$(find_pretrain_step)
@@ -88,21 +91,18 @@ if [ "$PHASE" = "pretrain_fresh" ]; then
     python -m nanochat.report reset
 
     echo "=== Phase 1: Download English data (ClimbMix) ==="
-    # With depth=20 + RATIO=150: ~59B total tokens, 50% English = ~29B English tokens
-    # Each ClimbMix shard ≈ 60M tokens → need ~480 shards English
-    # But mix is 50/50 by shard count and we have 19 non-English × 20 shards = 380 non-EN
-    # → need 380 English shards. Predownload 8 for tokenizer, rest in background.
-    python -m nanochat.dataset -n 8
-    python -m nanochat.dataset -n 400 &
+    # RATIO=26 → ~10.2B tokens total, 50% English = ~5.1B English tokens
+    # Each ClimbMix shard ≈ 60M tokens → need ~85 shards; download 120 for headroom
+    python -m nanochat.dataset -n 120 &
     EN_DOWNLOAD_PID=$!
 
     echo "=== Phase 1: Download multilingual data (mC4) ==="
-    # 20 shards × 19 languages = 380 shards, each ~50K docs / ~25M tokens
-    # → ~475B non-English tokens (more than enough; dataloader cycles as needed)
-    python -m nanochat.multilingual_dataset --shards-per-lang 20 -w 4 &
+    # 5 shards × 19 languages × ~25M tokens/shard = ~2.4B non-EN tokens
+    # Dataloader cycles through shards, so 2.4B tokens covers the 5.1B non-EN budget ~2×
+    python -m nanochat.multilingual_dataset --shards-per-lang 5 -w 8 &
     ML_DOWNLOAD_PID=$!
 
-    echo "=== Phase 1: Waiting for initial data (English 8 shards) ==="
+    echo "=== Phase 1: Waiting for all downloads... ==="
     wait $EN_DOWNLOAD_PID
     wait $ML_DOWNLOAD_PID
     echo "All data downloads complete."
@@ -121,7 +121,7 @@ fi
 # PHASE 2: Pretraining
 
 if [ "$PHASE" = "pretrain_fresh" ] || [ "$PHASE" = "pretrain_resume" ]; then
-    echo "=== Phase 2: Pretraining (depth=$DEPTH, ~393M params, overtrained ~${RATIO}x Chinchilla) ==="
+    echo "=== Phase 2: Pretraining (depth=$DEPTH, ~393M params, ~${RATIO}x Chinchilla) ==="
 
     RESUME_ARG=""
     PRETRAIN_STEP=$(find_pretrain_step)
@@ -130,11 +130,9 @@ if [ "$PHASE" = "pretrain_fresh" ] || [ "$PHASE" = "pretrain_resume" ]; then
         echo "  Resuming from step $PRETRAIN_STEP"
     fi
 
-    # H100 throughput notes:
-    #   depth=20, FP8 BF16 → ~280-320K tok/sec → 52B tokens in ~50h ✓
-    #   TOTAL_BS=1M, BATCH=64: grad_accum = 1M / (64×2048) = 8 steps → good utilization
-    #   --target-param-data-ratio=$RATIO: training stops at RATIO × params tokens
-    #   If spot is preempted before that, SIGTERM saves checkpoint; resume next session
+    # H100 throughput: depth=20 FP8 → ~280-320K tok/s
+    # RATIO=26 → 26 × 393M / 1M batch = ~10,218 steps × 3.3s/step ≈ 9.4h ✓
+    # TOTAL_BS=1M: grad_accum = 1M / (64×2048) = 8 steps
     NANOCHAT_DATA_DIR="$NANOCHAT_BASE_DIR/base_data_multilingual_mix" \
     torchrun --standalone --nproc_per_node=1 -m scripts.base_train -- \
         --depth=$DEPTH \
